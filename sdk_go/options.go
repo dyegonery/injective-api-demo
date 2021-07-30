@@ -181,18 +181,57 @@ func initStatsdOptions(
 	})
 }
 
+// initBinanceOptions sets Binance API config
+func initBinanceOptions(
+	cmd *cli.Cmd,
+	binanceKey **string,
+	binanceSecret **string,
+	binanceSubaccount **string,
+) {
+	*binanceKey = cmd.String(cli.StringOpt{
+		Name:   "binance-key",
+		Desc:   "Specify API Key for Binance API.",
+		EnvVar: "BINANCE_API_KEY",
+		Value:  "",
+	})
+
+	*binanceSecret = cmd.String(cli.StringOpt{
+		Name:   "binance-secret",
+		Desc:   "Specify API Secret for Binance API.",
+		EnvVar: "BINANCE_API_SECRET",
+		Value:  "",
+	})
+
+	*binanceSubaccount = cmd.String(cli.StringOpt{
+		Name:   "binance-subaccount",
+		Desc:   "Specify Subaccount label for Binance API.",
+		EnvVar: "BINANCE_API_SUBACCOUNT",
+		Value:  "",
+	})
+
+}
+
 func initTradingOptions(
 	cmd *cli.Cmd,
 	sendAlert **bool,
 	historySec **int,
 	injSymbols **[]string,
+	bnnSymbols **[]string,
+	bnnhedgeType **[]string,
 	sendSelfOrder **bool,
-	bufferTicks **int,
+	bufferTicks **[]int,
+	bufferQtyPct **[]int,
 	minPnlPct **int,
 	maxDDPct **int,
 	maxPositionPct **int,
-	maxOrderValue **int,
-	spotSideCount **int,
+	maxOrderValue **[]float64,
+	discountFactor **[]int,
+	spotSideCount **[]int,
+	slipagePct **[]float64,
+	hedgeCX **bool,
+	mysqlHost **string,
+	mysqlUser **string,
+	mysqlPwd **string,
 ) {
 	*sendAlert = cmd.Bool(cli.BoolOpt{
 		Name:   "send-alert",
@@ -215,6 +254,20 @@ func initTradingOptions(
 		Value:  []string{},
 	})
 
+	*bnnSymbols = cmd.Strings(cli.StringsOpt{
+		Name:   "binance-symbols",
+		Desc:   "binance market for strategy",
+		EnvVar: "BINANCE_SYMBOLS",
+		Value:  []string{},
+	})
+
+	*bnnhedgeType = cmd.Strings(cli.StringsOpt{
+		Name:   "hedge type for the pair",
+		Desc:   "the way to hedge for binance",
+		EnvVar: "BINANCE_HEDGE_TYPE",
+		Value:  []string{},
+	})
+
 	*sendSelfOrder = cmd.Bool(cli.BoolOpt{
 		Name:   "send-self-fill-order",
 		Desc:   "for testing strategy logics",
@@ -222,11 +275,18 @@ func initTradingOptions(
 		Value:  false,
 	})
 
-	*bufferTicks = cmd.Int(cli.IntOpt{
+	*bufferTicks = cmd.Ints(cli.IntsOpt{
 		Name:   "buffer-ticks",
 		Desc:   "sensitivity for orderbook price changed",
 		EnvVar: "BUFFER_TICKS_FOR_UPDATE_ORDER",
-		Value:  10,
+		Value:  []int{},
+	})
+
+	*bufferQtyPct = cmd.Ints(cli.IntsOpt{
+		Name:   "buffer-qty-pct",
+		Desc:   "sensitivity for orderbook qty changed",
+		EnvVar: "BUFFER_QTY_PCT_FOR_UPDATE_ORDER",
+		Value:  []int{},
 	})
 
 	*minPnlPct = cmd.Int(cli.IntOpt{
@@ -250,17 +310,59 @@ func initTradingOptions(
 		Value:  10,
 	})
 
-	*maxOrderValue = cmd.Int(cli.IntOpt{
+	*maxOrderValue = cmd.Floats64(cli.Floats64Opt{
 		Name:   "max-order-value",
 		Desc:   "max order value in usd",
 		EnvVar: "MAX_ORDER_VALUE_USD",
-		Value:  90,
+		Value:  []float64{},
 	})
 
-	*spotSideCount = cmd.Int(cli.IntOpt{
+	*discountFactor = cmd.Ints(cli.IntsOpt{
+		Name:   "discount-factor",
+		Desc:   "for referencing cefi market",
+		EnvVar: "DISCOUNT_PCT_FOR_REFERENCING",
+		Value:  []int{},
+	})
+
+	*spotSideCount = cmd.Ints(cli.IntsOpt{
 		Name:   "spot-book-side-count",
 		Desc:   "how many order for each side",
 		EnvVar: "SPOT_BOOK_SIDE_ORDER_COUNT",
-		Value:  8,
+		Value:  []int{},
+	})
+
+	*slipagePct = cmd.Floats64(cli.Floats64Opt{
+		Name:   "slipage-pct",
+		Desc:   "slipage in percentage",
+		EnvVar: "SLIPAGE_PCT",
+		Value:  []float64{},
+	})
+
+	*hedgeCX = cmd.Bool(cli.BoolOpt{
+		Name:   "send-order-hedge-cx",
+		Desc:   "switch hedge mode",
+		EnvVar: "HEDGE_CROSS_EXCHANGE",
+		Value:  true,
+	})
+
+	*mysqlHost = cmd.String(cli.StringOpt{
+		Name:   "mysql-host",
+		Desc:   "host of mysql",
+		EnvVar: "MYSQL_HOST",
+		Value:  "",
+	})
+
+	*mysqlUser = cmd.String(cli.StringOpt{
+		Name:   "mysql-user",
+		Desc:   "user of mysql",
+		EnvVar: "MYSQL_USER",
+		Value:  "",
+	})
+
+	*mysqlPwd = cmd.String(cli.StringOpt{
+		Name:   "mysql-pwd",
+		Desc:   "password of mysql",
+		EnvVar: "MYSQL_PWD",
+		Value:  "",
 	})
 }
