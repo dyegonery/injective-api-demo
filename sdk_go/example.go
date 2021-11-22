@@ -1,31 +1,51 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
 	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
 	log "github.com/xlab/suplog"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 
 	chainclient "github.com/InjectiveLabs/sdk-go/chain/client"
+	"github.com/InjectiveLabs/sdk-go/chain/crypto/ethsecp256k1"
+	"github.com/InjectiveLabs/sdk-go/chain/crypto/hd"
 	exchangetypes "github.com/InjectiveLabs/sdk-go/chain/exchange/types"
 	accountsPB "github.com/InjectiveLabs/sdk-go/exchange/accounts_rpc/pb"
 	spotExchangePB "github.com/InjectiveLabs/sdk-go/exchange/spot_exchange_rpc/pb"
+	cosmcrypto "github.com/cosmos/cosmos-sdk/crypto"
+	"github.com/cosmos/cosmos-sdk/crypto/keyring"
+	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	cosmtypes "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	"github.com/ethereum/go-ethereum/common"
 )
+
+const defaultKeyringKeyName = "validator"
+
+var emptyCosmosAddress = cosmtypes.AccAddress{}
 
 func main() {
 	// initial all the parameter first
 	var (
 		// Cosmos params
 		cosmosChainID   string = "injective-1"
-		cosmosGRPC      string = "tcp://localhost:9900"
-		tendermintRPC   string = "http://localhost:26657"
+		cosmosGRPC      string = "tcp://sentry0.injective.network:9900"
+		tendermintRPC   string = "http://sentry0.injective.network:26657"
 		cosmosGasPrices string = "500000000inj"
 
 		// Cosmos Key Management
@@ -39,22 +59,7 @@ func main() {
 		cosmosUseLedger     bool   = false
 
 		// Exchange API params
-		exchangeGRPC string = "tcp://localhost:9910"
-
-		// Metrics
-		statsdPrefix   string = "trading"
-		statsdAddr     string = "localhost:8125"
-		statsdStuckDur string = "5m"
-		statsdMocking  string = "false"
-		statsdDisabled string = "true"
-	)
-
-	startMetricsGathering(
-		&statsdPrefix,
-		&statsdAddr,
-		&statsdStuckDur,
-		&statsdMocking,
-		&statsdDisabled,
+		exchangeGRPC string = "tcp://sentry0.injective.network:9910"
 	)
 
 	senderAddress, cosmosKeyring, err := initCosmosKeyring(
@@ -112,7 +117,7 @@ func main() {
 	// set up api clients
 	accountsClient := accountsPB.NewInjectiveAccountsRPCClient(exchangeConn)
 	spotsClient := spotExchangePB.NewInjectiveSpotExchangeRPCClient(exchangeConn)
-	cosmosClient := chainclient.cosmosClient
+	cosmosClient := daemonClient
 	bankQueryClient := banktypes.NewQueryClient(daemonConn)
 
 	//demo go-sdk part
@@ -252,7 +257,7 @@ func main() {
 			// preparing new order, orderType 1 (buy), 2 (sell)
 			msgs = make([]cosmtypes.Msg, 0)
 			newOrder := &exchangetypes.SpotOrder{
-				MarketId:  market.MarketID.Hex(),
+				MarketId:  market.MarketId,
 				OrderType: 1,
 				OrderInfo: exchangetypes.OrderInfo{
 					SubaccountId: subaccountID.Hex(),
@@ -307,4 +312,243 @@ func getQuantity(value decimal.Decimal, minTickSize cosmtypes.Dec, baseDecimals 
 	midScaledInt := mid.Mul(scale).TruncateDec()
 	qty = minTickSize.Mul(midScaledInt)
 	return qty
+}
+
+// utility functions below
+
+func initCosmosKeyring(
+	cosmosKeyringDir *string,
+	cosmosKeyringAppName *string,
+	cosmosKeyringBackend *string,
+	cosmosKeyFrom *string,
+	cosmosKeyPassphrase *string,
+	cosmosPrivKey *string,
+	cosmosUseLedger *bool,
+) (cosmtypes.AccAddress, keyring.Keyring, error) {
+	switch {
+	case len(*cosmosPrivKey) > 0:
+		if *cosmosUseLedger {
+			err := errors.New("cannot combine ledger and privkey options")
+			return emptyCosmosAddress, nil, err
+		}
+
+		pkBytes, err := hexToBytes(*cosmosPrivKey)
+		if err != nil {
+			err = errors.Wrap(err, "failed to hex-decode cosmos account privkey")
+			return emptyCosmosAddress, nil, err
+		}
+
+		// Specfic to Injective chain with Ethermint keys
+		// Should be secp256k1.PrivKey for generic Cosmos chain
+		cosmosAccPk := &ethsecp256k1.PrivKey{
+			Key: pkBytes,
+		}
+
+		addressFromPk := cosmtypes.AccAddress(cosmosAccPk.PubKey().Address().Bytes())
+
+		var keyName string
+
+		// check that if cosmos 'From' specified separately, it must match the provided privkey,
+		if len(*cosmosKeyFrom) > 0 {
+			addressFrom, err := cosmtypes.AccAddressFromBech32(*cosmosKeyFrom)
+			if err == nil {
+				if !bytes.Equal(addressFrom.Bytes(), addressFromPk.Bytes()) {
+					err = errors.Errorf("expected account address %s but got %s from the private key", addressFrom.String(), addressFromPk.String())
+					return emptyCosmosAddress, nil, err
+				}
+			} else {
+				// use it as a name then
+				keyName = *cosmosKeyFrom
+			}
+		}
+
+		if len(keyName) == 0 {
+			keyName = defaultKeyringKeyName
+		}
+
+		// wrap a PK into a Keyring
+		kb, err := KeyringForPrivKey(keyName, cosmosAccPk)
+		return addressFromPk, kb, err
+
+	case len(*cosmosKeyFrom) > 0:
+		var fromIsAddress bool
+		addressFrom, err := cosmtypes.AccAddressFromBech32(*cosmosKeyFrom)
+		if err == nil {
+			fromIsAddress = true
+		}
+
+		var passReader io.Reader = os.Stdin
+		if len(*cosmosKeyPassphrase) > 0 {
+			passReader = newPassReader(*cosmosKeyPassphrase)
+		}
+
+		var absoluteKeyringDir string
+		if filepath.IsAbs(*cosmosKeyringDir) {
+			absoluteKeyringDir = *cosmosKeyringDir
+		} else {
+			absoluteKeyringDir, _ = filepath.Abs(*cosmosKeyringDir)
+		}
+
+		kb, err := keyring.New(
+			*cosmosKeyringAppName,
+			*cosmosKeyringBackend,
+			absoluteKeyringDir,
+			passReader,
+			hd.EthSecp256k1Option(),
+		)
+		if err != nil {
+			err = errors.Wrap(err, "failed to init keyring")
+			return emptyCosmosAddress, nil, err
+		}
+
+		var keyInfo keyring.Info
+		if fromIsAddress {
+			if keyInfo, err = kb.KeyByAddress(addressFrom); err != nil {
+				err = errors.Wrapf(err, "couldn't find an entry for the key %s in keybase", addressFrom.String())
+				return emptyCosmosAddress, nil, err
+			}
+		} else {
+			if keyInfo, err = kb.Key(*cosmosKeyFrom); err != nil {
+				err = errors.Wrapf(err, "could not find an entry for the key '%s' in keybase", *cosmosKeyFrom)
+				return emptyCosmosAddress, nil, err
+			}
+		}
+
+		switch keyType := keyInfo.GetType(); keyType {
+		case keyring.TypeLocal:
+			// kb has a key and it's totally usable
+			return keyInfo.GetAddress(), kb, nil
+		case keyring.TypeLedger:
+			// the kb stores references to ledger keys, so we must explicitly
+			// check that. kb doesn't know how to scan HD keys - they must be added manually before
+			if *cosmosUseLedger {
+				return keyInfo.GetAddress(), kb, nil
+			}
+			err := errors.Errorf("'%s' key is a ledger reference, enable ledger option", keyInfo.GetName())
+			return emptyCosmosAddress, nil, err
+		case keyring.TypeOffline:
+			err := errors.Errorf("'%s' key is an offline key, not supported yet", keyInfo.GetName())
+			return emptyCosmosAddress, nil, err
+		case keyring.TypeMulti:
+			err := errors.Errorf("'%s' key is an multisig key, not supported yet", keyInfo.GetName())
+			return emptyCosmosAddress, nil, err
+		default:
+			err := errors.Errorf("'%s' key  has unsupported type: %s", keyInfo.GetName(), keyType)
+			return emptyCosmosAddress, nil, err
+		}
+
+	default:
+		err := errors.New("insufficient cosmos key details provided")
+		return emptyCosmosAddress, nil, err
+	}
+}
+
+func newPassReader(pass string) io.Reader {
+	return &passReader{
+		pass: pass,
+		buf:  new(bytes.Buffer),
+	}
+}
+
+type passReader struct {
+	pass string
+	buf  *bytes.Buffer
+}
+
+var _ io.Reader = &passReader{}
+
+func (r *passReader) Read(p []byte) (n int, err error) {
+	n, err = r.buf.Read(p)
+	if err == io.EOF || n == 0 {
+		r.buf.WriteString(r.pass + "\n")
+
+		n, err = r.buf.Read(p)
+	}
+
+	return
+}
+
+// KeyringForPrivKey creates a temporary in-mem keyring for a PrivKey.
+// Allows to init Context when the key has been provided in plaintext and parsed.
+func KeyringForPrivKey(name string, privKey cryptotypes.PrivKey) (keyring.Keyring, error) {
+	kb := keyring.NewInMemory(hd.EthSecp256k1Option())
+	tmpPhrase := randPhrase(64)
+	armored := cosmcrypto.EncryptArmorPrivKey(privKey, tmpPhrase, privKey.Type())
+	err := kb.ImportPrivKey(name, armored, tmpPhrase)
+	if err != nil {
+		err = errors.Wrap(err, "failed to import privkey")
+		return nil, err
+	}
+
+	return kb, nil
+}
+
+func randPhrase(size int) string {
+	buf := make([]byte, size)
+	_, err := rand.Read(buf)
+	orPanic(err)
+
+	return string(buf)
+}
+
+func orPanic(err error) {
+	if err != nil {
+		log.Panicln()
+	}
+}
+
+func waitForService(ctx context.Context, conn *grpc.ClientConn) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Errorf("Service wait timed out. Please run injective exchange service:\n\nmake install && injective-exchange")
+		default:
+			state := conn.GetState()
+
+			if state != connectivity.Ready {
+				time.Sleep(time.Second)
+				continue
+			}
+
+			return nil
+		}
+	}
+}
+
+func grpcDialEndpoint(protoAddr string) (conn *grpc.ClientConn, err error) {
+	conn, err = grpc.Dial(protoAddr, grpc.WithInsecure(), grpc.WithContextDialer(dialerFunc))
+	if err != nil {
+		err := errors.Wrapf(err, "failed to connect to the gRPC: %s", protoAddr)
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func hexToBytes(str string) ([]byte, error) {
+	if strings.HasPrefix(str, "0x") {
+		str = str[2:]
+	}
+
+	data, err := hex.DecodeString(str)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+func dialerFunc(ctx context.Context, protoAddr string) (net.Conn, error) {
+	proto, address := protocolAndAddress(protoAddr)
+	conn, err := net.Dial(proto, address)
+	return conn, err
+}
+
+func protocolAndAddress(listenAddr string) (string, string) {
+	protocol, address := "tcp", listenAddr
+	parts := strings.SplitN(address, "://", 2)
+	if len(parts) == 2 {
+		protocol, address = parts[0], parts[1]
+	}
+	return protocol, address
 }
