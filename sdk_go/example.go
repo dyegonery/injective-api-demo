@@ -109,7 +109,7 @@ func main() {
 	waitForService(exchangeWaitCtx, exchangeConn)
 	cancelWait()
 
-	// set up clients
+	// set up api clients
 	accountsClient := accountsPB.NewInjectiveAccountsRPCClient(exchangeConn)
 	spotsClient := spotExchangePB.NewInjectiveSpotExchangeRPCClient(exchangeConn)
 	cosmosClient := chainclient.cosmosClient
@@ -118,7 +118,7 @@ func main() {
 	//demo go-sdk part
 	ctx, _ := context.WithCancel(context.Background())
 
-	//deposit all balances
+	//deposit all balances from inj chain to trading subaccount
 	sender := cosmosClient.FromAddress()
 	resp, err := bankQueryClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{
 		Address:    sender.String(),
@@ -155,7 +155,7 @@ func main() {
 		msgs = append(msgs, &msg)
 	}
 	if len(msgs) > 0 {
-		// this is the way to execute msgs
+		// this is the way to execute msgs (sync mode)
 		if _, err := cosmosClient.SyncBroadcastMsg(msgs...); err != nil {
 			log.Errorln("Failed depositing to exchange with err: ", err.Error())
 		}
