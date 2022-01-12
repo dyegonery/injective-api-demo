@@ -6,7 +6,7 @@ from core.object import OrderData, PositionData, TradeData, TickData
 from math import fabs
 from math import log
 import time
-from util.decimal_utils import floor_to
+from util.decimal_utils import floor_to, round_to
 from util.constant import ORDERTYPE_DICT
 from pyinjective.composer import Composer as ProtoMsgComposer
 from pyinjective.transaction import Transaction
@@ -27,6 +27,8 @@ class Demo(PerpTemplate):
         self.curr_duration_volume = 0
         self.last_duration_volume = 0
         self.tick = None
+        self.entry_price = 0
+        self.stop_loss = float(self.setting["stop_loss"])
 
         self.interval = int(self.setting["interval"])
         self.active_orders = {}  # [order_hash, : order_data]
@@ -81,10 +83,14 @@ class Demo(PerpTemplate):
         position = await self.get_position()
         if len(position.positions) > 0:
             position_data = position.positions[0]
+            self.entry_price = round_to(
+                    float(position_data.entry_price) *
+                    pow(10, self.base_decimal - self.quote_decimal), self.tick_size)
             self.net_position = float(
                 position_data.quantity) if position_data.direction == "long" else -float(position_data.quantity)
             self.logger.info(
                 f"net position in {self.symbol}:{self.net_position}")
+            self.logger.info(f"Entry Price: {self.entry_price}")
         else:
             self.logger.info("net position is zero")
             self.net_position = 0
@@ -109,8 +115,24 @@ class Demo(PerpTemplate):
         mid_price = (self.tick.bid_price_1 + self.tick.ask_price_1) / 2
 
         half_spread = mid_price * self.spread_ratio / 2
-        self.bid_price = mid_price - half_spread
-        self.ask_price = mid_price + half_spread
+        pnl = 0
+
+        if self.net_position > 0:
+            # Long Position open
+            pnl = (self.tick.ask_price_1 - self.entry_price) / self.entry_price
+        elif self.net_position < 0:
+            # Short position open
+            pnl = (self.entry_price - self.tick.bid_price_) / self.entry_price
+
+        if pnl < (self.stop_loss * -1):
+            # Do reduce only order, and possibly increase spread?
+        else:
+            self.bid_price = mid_price - half_spread
+            self.ask_price = mid_price + half_spread
+
+        self.logger.info(f"Entry price: {self.entry_price}")
+        self.logger.info(f"Bid Price: {self.bid_price}")
+        self.logger.info(f"Ask Price: {self.ask_price}")
 
     async def market_making(self):
         self.msg_list = []
@@ -158,8 +180,8 @@ class Demo(PerpTemplate):
             # broadcast tx: send_tx_async_mode, send_tx_sync_mode, send_tx_block_mode
             res = await self.client.send_tx_block_mode(tx_raw_bytes)
             res_msg = ProtoMsgComposer.MsgResponses(res.data)
-            self.logger.info(
-                "tx response: {}\n tx msg response:{}".format(res, res_msg))
+            # self.logger.info(
+            #     "tx response: {}\n tx msg response:{}".format(res, res_msg))
 
     async def on_order(self, order_data: OrderData):
         if order_data.state == "booked":
@@ -182,6 +204,7 @@ class Demo(PerpTemplate):
     async def on_position(self, position_data: PositionData):
         self.net_position = position_data.quantity if position_data.direction == "long" else - \
             position_data.quantity
+        self.entry_price = position_data.entry_price
 
     def quote_bid_ask(self):
         self.msg_list.append(
